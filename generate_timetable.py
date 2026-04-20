@@ -649,13 +649,24 @@ def assign_rooms(final_courses, slot_matrix):
 
     for slot, entries in slot_groups.items():
         # Group entries by (course_code, group_key) within this slot
-        # (same elective taught to multiple batches = same physical class, so key is 'ALL')
-        # (core courses taught to different sections might be split across rooms)
+        # Core courses are taught in 2 physical groups:
+        # Group A: ONLY ICT+CS Sec A
+        # Group B: ICT+CS Sec B + MnC + EVD + CS-Only
         course_groups = defaultdict(list)
         for c in entries:
             code = c['course_code']
             truly_core = c['is_core'] and code not in ELECTIVE_ENROLLMENT
-            group_key = c.get('room', '').strip() if truly_core else 'ALL'
+            if truly_core:
+                sub_batch = c.get('sub_batch', '')
+                sec = c.get('row_sec', '')
+                # Force the logical lecture grouping
+                if '(ICT + CS)' in sub_batch and 'Sec A' in sec:
+                    group_key = 'Lecture_Group_A'
+                else:
+                    group_key = 'Lecture_Group_B'
+            else:
+                group_key = 'ALL'
+            
             course_groups[(code, group_key)].append(c)
 
         # Calculate enrollment for each course group
@@ -663,15 +674,12 @@ def assign_rooms(final_courses, slot_matrix):
         for (code, group_key), clist in course_groups.items():
             truly_core = clist[0]['is_core'] and code not in ELECTIVE_ENROLLMENT
             if truly_core:
-                # Core course: all batches attend
-                seen_batches = set()
-                enrollment = 0
-                for c in clist:
-                    batch_key = (c['sub_batch'], c['row_sec'])
-                    if batch_key not in seen_batches:
-                        seen_batches.add(batch_key)
-                        enrollment += get_course_enrollment(
-                            code, c['sub_batch'], c['row_sec'], True)
+                # Force strictly known university physical section sizes
+                # because the Excel file frequently misses programs (like CS-Only)
+                if group_key == 'Lecture_Group_A':
+                    enrollment = 180  # ICT+CS Sec A
+                else:
+                    enrollment = 260  # ICT+CS Sec B (100) + MnC (60) + CS (60) + EVD (40)
             else:
                 # Elective: use ELECTIVE_ENROLLMENT (one class, shared)
                 enrollment = get_course_enrollment(
