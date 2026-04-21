@@ -507,12 +507,16 @@ def apply_soft_constraints(assignment, sb_props, conflicts, slot_matrix):
     """
     import random
 
-    # Precompute slot→days mapping
+    # Precompute slot→days mapping and slot→(day, period_idx) mapping
     slot_to_days = defaultdict(set)
+    slot_to_day_periods = defaultdict(list)
     for day, periods_map in slot_matrix.items():
-        for _, slot in periods_map.items():
-            if slot != 'Slot-Free':
-                slot_to_days[slot].add(day)
+        for p_idx, period in enumerate(PERIODS):
+            if period in periods_map:
+                slot = periods_map[period]
+                if slot != 'Slot-Free':
+                    slot_to_days[slot].add(day)
+                    slot_to_day_periods[slot].append((day, p_idx))
 
     def soft_score(asgn):
         """Lower is better."""
@@ -520,12 +524,21 @@ def apply_soft_constraints(assignment, sb_props, conflicts, slot_matrix):
         # Build per-batch day schedule
         batch_day_rooms = defaultdict(lambda: defaultdict(list))
         batch_day_slots = defaultdict(lambda: defaultdict(list))
+        # Build per-faculty day schedule (for consecutive classes)
+        fac_day_periods = defaultdict(lambda: defaultdict(set))
+
         for root, slot in asgn.items():
             for sg in sb_props[root]['sgs']:
                 for day in slot_to_days.get(slot, []):
                     rooms = sb_props[root].get('rooms', set())
                     batch_day_rooms[sg][day].extend(rooms)
                     batch_day_slots[sg][day].append(slot)
+            
+            # Record periods for faculties
+            for f in sb_props[root].get('facs', set()):
+                if f.lower() != 'nan':
+                    for day, p_idx in slot_to_day_periods.get(slot, []):
+                        fac_day_periods[f][day].add(p_idx)
 
         # Penalty: room changes on same day for same batch
         for sg, day_map in batch_day_rooms.items():
@@ -538,10 +551,16 @@ def apply_soft_constraints(assignment, sb_props, conflicts, slot_matrix):
         day_order = {d: i for i, d in enumerate(DAYS)}
         course_days = defaultdict(set)
         for root, slot in asgn.items():
-            for node in sb_props[root]['nodes']:
-                for c in [root]:  # just use root as proxy
-                    for day in slot_to_days.get(slot, []):
-                        course_days[root].add(day_order.get(day, 0))
+            for day in slot_to_days.get(slot, []):
+                course_days[root].add(day_order.get(day, 0))
+
+        # Penalty: consecutive classes for same faculty
+        for f, day_map in fac_day_periods.items():
+            for day, period_set in day_map.items():
+                sorted_p = sorted(list(period_set))
+                for i in range(len(sorted_p) - 1):
+                    if sorted_p[i+1] == sorted_p[i] + 1:
+                        penalty += 5  # Add harsh penalty for consecutive teaching
 
         return penalty
 
@@ -648,25 +667,12 @@ def assign_rooms(final_courses, slot_matrix):
     unchanged = 0
 
     for slot, entries in slot_groups.items():
-        # Group entries by (course_code, group_key) within this slot
-        # Core courses are taught in 2 physical groups:
-        # Group A: ONLY ICT+CS Sec A
-        # Group B: ICT+CS Sec B + MnC + EVD + CS-Only
+        # Group core courses by section (Sec A vs Sec B) to avoid merging parallel lectures
         course_groups = defaultdict(list)
         for c in entries:
             code = c['course_code']
             truly_core = c['is_core'] and code not in ELECTIVE_ENROLLMENT
-            if truly_core:
-                sub_batch = c.get('sub_batch', '')
-                sec = c.get('row_sec', '')
-                # Force the logical lecture grouping
-                if '(ICT + CS)' in sub_batch and 'Sec A' in sec:
-                    group_key = 'Lecture_Group_A'
-                else:
-                    group_key = 'Lecture_Group_B'
-            else:
-                group_key = 'ALL'
-            
+            group_key = c.get('row_sec', '').strip() if truly_core else 'ALL'
             course_groups[(code, group_key)].append(c)
 
         # Calculate enrollment for each course group
@@ -674,14 +680,15 @@ def assign_rooms(final_courses, slot_matrix):
         for (code, group_key), clist in course_groups.items():
             truly_core = clist[0]['is_core'] and code not in ELECTIVE_ENROLLMENT
             if truly_core:
-                # Force strictly known university physical section sizes
-                # because the Excel file frequently misses programs (like CS-Only)
-                if group_key == 'Lecture_Group_A':
-                    enrollment = 180  # ICT+CS Sec A
-                else:
-                    enrollment = 260  # ICT+CS Sec B (100) + MnC (60) + CS (60) + EVD (40)
+                seen_batches = set()
+                enrollment = 0
+                for c in clist:
+                    batch_key = (c['sub_batch'], c['row_sec'])
+                    if batch_key not in seen_batches:
+                        seen_batches.add(batch_key)
+                        enrollment += get_course_enrollment(
+                            code, c['sub_batch'], c['row_sec'], True)
             else:
-                # Elective: use ELECTIVE_ENROLLMENT (one class, shared)
                 enrollment = get_course_enrollment(
                     code, clist[0]['sub_batch'], clist[0]['row_sec'], False)
             course_enrollment[(code, group_key)] = enrollment
