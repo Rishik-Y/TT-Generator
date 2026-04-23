@@ -2178,26 +2178,24 @@ def admin_manage_users():
             <div id="create-error" class="error-msg" style="display:none;margin-bottom:1rem;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:var(--accent-red);padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;"></div>
             <div id="create-success" class="success-msg" style="display:none;margin-bottom:1rem;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:var(--accent-green);padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;"></div>
 
-            {'<p style="color:var(--text-muted);font-size:0.85rem;">All faculty members already have accounts.</p>' if not unlinked_faculty else f"""
             <form id="create-user-form" onsubmit="createUser(event)" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;">
                 <div class="filter-group">
-                    <label>Faculty Member</label>
-                    <select id="faculty-select" required onchange="updateEmail()">
-                        <option value="">Select faculty...</option>
+                    <label>Link to Faculty (optional)</label>
+                    <select id="faculty-select" onchange="updateEmail()">
+                        <option value="">— No link / Custom —</option>
                         {faculty_options}
                     </select>
                 </div>
                 <div class="filter-group">
-                    <label>Email (auto-generated)</label>
-                    <input type="email" id="user-email" readonly style="min-width:220px;opacity:0.7;">
+                    <label>Email</label>
+                    <input type="email" id="user-email" placeholder="faculty@daiict.ac.in" required style="min-width:220px;">
                 </div>
                 <div class="filter-group">
-                    <label>Temp Password (auto-generated)</label>
-                    <input type="text" id="temp-password" readonly style="min-width:200px;font-family:monospace;opacity:0.7;">
+                    <label>Temp Password <span onclick="document.getElementById('temp-password').value=generatePassword()" style="cursor:pointer;color:var(--accent-blue);font-size:0.7rem;margin-left:0.3rem;">🔄 Regenerate</span></label>
+                    <input type="text" id="temp-password" required style="min-width:200px;font-family:monospace;">
                 </div>
                 <button type="submit" class="btn btn-green" id="create-btn">Create Account</button>
             </form>
-            """}
         </div>
     </div>
 
@@ -2247,8 +2245,10 @@ def admin_manage_users():
         const sel = document.getElementById('faculty-select');
         const opt = sel.options[sel.selectedIndex];
         const short = opt.getAttribute('data-short') || '';
-        document.getElementById('user-email').value = short ? (short.toLowerCase() + '@daiict.ac.in') : '';
-        document.getElementById('temp-password').value = short ? generatePassword() : '';
+        if (short) {{
+            document.getElementById('user-email').value = short.toLowerCase() + '@daiict.ac.in';
+        }}
+        document.getElementById('temp-password').value = generatePassword();
     }}
 
     async function createUser(e) {{
@@ -2263,8 +2263,8 @@ def admin_manage_users():
         errorDiv.style.display = 'none';
         successDiv.style.display = 'none';
 
-        if (!facultyId || !email || !password) {{
-            errorDiv.textContent = 'Please select a faculty member';
+        if (!email || !password) {{
+            errorDiv.textContent = 'Please enter email and password';
             errorDiv.style.display = 'block';
             return;
         }}
@@ -2355,12 +2355,12 @@ def admin_manage_users():
 def api_admin_create_user():
     """Admin API endpoint to create a new faculty Firebase account."""
     data = request.get_json()
-    faculty_id = data.get('faculty_id')
+    faculty_id = data.get('faculty_id') or None  # Optional
     email = data.get('email', '').strip()
     password = data.get('password', '').strip()
 
-    if not faculty_id or not email or not password:
-        return jsonify({'success': False, 'error': 'Missing required fields'}), 400
+    if not email or not password:
+        return jsonify({'success': False, 'error': 'Email and password are required'}), 400
 
     # Validate password against policy
     ok, err_msg = validate_password(password)
@@ -2380,6 +2380,7 @@ def api_admin_create_user():
         uid = user_record.uid
 
         # Insert into our database
+        fid = int(faculty_id) if faculty_id else None
         db = DBManager(quiet=True)
         try:
             db.cur.execute(
@@ -2387,7 +2388,7 @@ def api_admin_create_user():
                    VALUES (%s, %s, 'FACULTY', %s, FALSE)
                    ON CONFLICT (uid) DO UPDATE
                    SET faculty_id = EXCLUDED.faculty_id, role = 'FACULTY'""",
-                (uid, email, int(faculty_id))
+                (uid, email, fid)
             )
             db.conn.commit()
         finally:
