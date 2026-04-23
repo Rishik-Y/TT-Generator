@@ -5,6 +5,7 @@
 -- ============================================================================
 
 -- Drop tables in reverse dependency order (for clean re-runs)
+DROP TABLE IF EXISTS user_role CASCADE;
 DROP TABLE IF EXISTS constraint_violation_log CASCADE;
 DROP TABLE IF EXISTS master_timetable CASCADE;
 DROP TABLE IF EXISTS batch_course_map CASCADE;
@@ -231,6 +232,26 @@ CREATE TABLE constraint_violation_log (
 COMMENT ON TABLE constraint_violation_log IS 'Audit log: records every constraint violation with timestamp and details';
 
 -- ============================================================================
+-- 11. USER ROLE TABLE (Firebase Authentication)
+-- Maps Firebase UIDs to application roles and faculty records.
+-- ============================================================================
+CREATE TABLE user_role (
+    uid              VARCHAR(128) PRIMARY KEY,
+    email            VARCHAR(150) NOT NULL UNIQUE,
+    role             VARCHAR(20) NOT NULL DEFAULT 'FACULTY',
+    faculty_id       INT REFERENCES faculty(faculty_id) ON DELETE SET NULL,
+    password_changed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT chk_role CHECK (role IN ('ADMIN', 'FACULTY'))
+);
+
+COMMENT ON TABLE user_role IS 'Maps Firebase Auth UIDs to application roles (ADMIN or FACULTY)';
+COMMENT ON COLUMN user_role.uid IS 'Firebase UID — primary key, set during account seeding';
+COMMENT ON COLUMN user_role.faculty_id IS 'Links FACULTY users to their faculty record for data scoping';
+COMMENT ON COLUMN user_role.password_changed IS 'FALSE = must change password on next login; TRUE = normal access';
+
+-- ============================================================================
 -- INDEXES (Performance Optimization)
 -- ============================================================================
 
@@ -254,6 +275,10 @@ CREATE INDEX idx_timetable_slot ON master_timetable(slot_id);
 
 -- Violation log by timestamp (for recent violations)
 CREATE INDEX idx_violation_time ON constraint_violation_log(detected_at DESC);
+
+-- User role lookups by email and role
+CREATE INDEX idx_user_role_email ON user_role(email);
+CREATE INDEX idx_user_role_role ON user_role(role);
 
 -- ============================================================================
 -- VIEWS (Human-Readable Queries)

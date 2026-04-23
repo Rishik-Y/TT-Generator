@@ -6,3 +6,10 @@ __pycache__/
 Generated_EXCEL_MODE.*
 Generated_DB_MODE.*
 Generated_Master_Timetable.*
+
+# Firebase Admin SDK (contains private keys — NEVER commit)
+*Firebase Admin SDK*.json
+serviceAccountKey*.json
+
+# OS files
+.DS_Store
