@@ -208,8 +208,11 @@ class DBManager:
             except ImportError:
                 ROOM_CAPACITIES = {}
 
+            # Also include all configured rooms so reassigned rooms can always map to room_id
+            room_candidates = set(rooms) | set(ROOM_CAPACITIES.keys())
+
             room_count = 0
-            for room in sorted(rooms):
+            for room in sorted(room_candidates):
                 capacity = ROOM_CAPACITIES.get(room, 0)
                 if capacity == 0:
                     continue  # Explicitly skip any zero-capacity/dropped rooms (like LAB A-SF)
@@ -232,6 +235,11 @@ class DBManager:
                         (room,)
                     )
                     self._room_cache[room] = self.cur.fetchone()[0]
+
+            # Safety net: ensure cache includes all currently persisted rooms
+            self.cur.execute("SELECT room_number, room_id FROM room")
+            for room_number, room_id in self.cur.fetchall():
+                self._room_cache[room_number] = room_id
 
             # 4. Extract and insert unique batches
             batches = set()
@@ -421,6 +429,16 @@ class DBManager:
                 course_id = self._course_cache.get(code)
                 batch_id = self._batch_cache.get((sb, sec))
                 room_id = self._room_cache.get(room) if room and room.lower() != 'nan' else None
+                if room_id is None and room and room.lower() not in ('nan', 'tbd'):
+                    # Fallback in case cache missed a persisted room.
+                    self.cur.execute(
+                        "SELECT room_id FROM room WHERE room_number = %s",
+                        (room,)
+                    )
+                    row = self.cur.fetchone()
+                    if row:
+                        room_id = row[0]
+                        self._room_cache[room] = room_id
 
                 if fac_id is None or course_id is None or batch_id is None:
                     skipped += 1
@@ -439,8 +457,8 @@ class DBManager:
 
                 # Insert one row per time slot in the slot group
                 for slot_id in slot_ids:
-                    # Dedup by (assignment_id, slot_id) — matches UNIQUE constraint
-                    entry_key = (assignment_id, slot_id)
+                    # Dedup by (assignment_id, batch_id, slot_id) — matches UNIQUE constraint
+                    entry_key = (assignment_id, batch_id, slot_id)
                     if entry_key in seen_entries:
                         deduped += 1
                         continue
@@ -451,9 +469,9 @@ class DBManager:
                         self.cur.execute(
                             """INSERT INTO master_timetable
                                (assignment_id, batch_id, room_id, slot_id,
-                                is_moved, original_slot_group)
+                                 is_moved, original_slot_group)
                                VALUES (%s, %s, %s, %s, %s, %s)
-                               ON CONFLICT (assignment_id, slot_id) DO NOTHING""",
+                               ON CONFLICT (assignment_id, batch_id, slot_id) DO NOTHING""",
                             (assignment_id, batch_id, room_id, slot_id,
                              is_moved, original_slot)
                         )
@@ -502,7 +520,7 @@ class DBManager:
             self.conn.commit()
             self._log(f"  ✓ {inserted} timetable entries written to Master_Timetable")
             if deduped:
-                self._log(f"  ✓ {deduped} duplicate entries de-duplicated (same faculty-course across batches)")
+                self._log(f"  ✓ {deduped} duplicate entries de-duplicated (same faculty-course for same batch/slot)")
             if violations_logged:
                 self._log(f"  ⚠ {violations_logged} constraint violations logged")
             else:
@@ -523,7 +541,7 @@ class DBManager:
             name = 'No Room Double-Booking'
         elif 'uq_batch_slot' in error_lower:
             name = 'Core Course Non-Overlap'
-        elif 'uq_assignment_slot' in error_lower:
+        elif 'uq_assignment_slot' in error_lower or 'uq_assignment_batch_slot' in error_lower:
             name = 'No Faculty Double-Booking'
         else:
             return None

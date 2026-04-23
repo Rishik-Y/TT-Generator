@@ -192,9 +192,9 @@ CREATE TABLE master_timetable (
 
     -- === DATABASE-LEVEL CONSTRAINT ENFORCEMENT ("Hard Locks") ===
 
-    -- A faculty-course assignment cannot be scheduled twice in the same slot
-    -- (this is always true — you can't teach the same class twice at the same time)
-    CONSTRAINT uq_assignment_slot UNIQUE (assignment_id, slot_id)
+    -- A faculty-course assignment for a specific batch cannot be scheduled
+    -- twice in the same slot.
+    CONSTRAINT uq_assignment_batch_slot UNIQUE (assignment_id, batch_id, slot_id)
 
     -- NOTE: UNIQUE(batch_id, slot_id) is NOT here because:
     --   Elective courses CAN share the same time slot for a batch.
@@ -320,8 +320,8 @@ SELECT
     r.room_number,
     r.room_type,
     r.capacity,
-    COUNT(mt.timetable_id) AS total_classes,
-    ROUND(COUNT(mt.timetable_id) * 100.0 / 25, 1) AS utilization_pct
+    COUNT(DISTINCT (mt.room_id, mt.slot_id)) AS total_classes,
+    ROUND(COUNT(DISTINCT (mt.room_id, mt.slot_id)) * 100.0 / 25, 1) AS utilization_pct
 FROM room r
 LEFT JOIN master_timetable mt ON r.room_id = mt.room_id
 GROUP BY r.room_id, r.room_number, r.room_type, r.capacity
