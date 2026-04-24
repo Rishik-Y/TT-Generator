@@ -74,9 +74,11 @@ BATCH_STRENGTH = {
 }
 
 # Section-level overrides for asymmetric splits
+# Sec A: 180 pure ICT students
+# Sec B: 100 ICT + 80 ICT+CS (minor) = 180 total for core courses
 SECTION_STRENGTH = {
     ('ICT + CS', 'Sec A'): 180,
-    ('ICT + CS', 'Sec B'): 100,
+    ('ICT + CS', 'Sec B'): 180,  # 100 ICT + 80 ICT+CS minors attend together
 }
 
 # ---------------------------------------------------------------------------
@@ -102,6 +104,48 @@ ELECTIVE_ENROLLMENT = {
     'CT423': 10,  'CT548': 14,  'EL464': 95,  'EL469': 110,
     'EL495': 38,  'EL527': 82,  'HM001': 30,
 }
+
+
+def load_config_from_db():
+    """Load configuration from PostgreSQL, overriding hardcoded defaults.
+
+    Tries to read room capacities, batch strengths, section overrides,
+    and elective enrollments from the database. Falls back to the
+    hardcoded dicts above if the DB is unavailable or empty.
+    """
+    global ROOM_CAPACITIES, BATCH_STRENGTH, SECTION_STRENGTH, ELECTIVE_ENROLLMENT
+
+    try:
+        from db_manager import DBManager
+        db = DBManager(quiet=True)
+
+        # Room capacities
+        rooms = db.get_room_config()
+        if rooms:
+            ROOM_CAPACITIES = rooms
+            print(f"  ✓ Loaded {len(rooms)} room capacities from database")
+
+        # Batch strengths
+        batches = db.get_batch_config()
+        if batches:
+            BATCH_STRENGTH = batches
+            print(f"  ✓ Loaded {len(batches)} batch strengths from database")
+
+        # Section overrides
+        sections = db.get_section_config()
+        if sections:
+            SECTION_STRENGTH = sections
+            print(f"  ✓ Loaded {len(sections)} section overrides from database")
+
+        # Elective enrollments
+        electives = db.get_elective_enrollment()
+        if electives:
+            ELECTIVE_ENROLLMENT = electives
+            print(f"  ✓ Loaded {len(electives)} elective enrollments from database")
+
+        db.close()
+    except Exception as e:
+        print(f"  ⚠ Could not load config from DB (using defaults): {e}")
 
 
 def get_batch_size(sub_batch, section):
@@ -767,28 +811,29 @@ def validate(final_courses, slot_matrix):
             schedule[(day, period)] = entries
 
     # Check faculty double-booking
-    # A real conflict is when the SAME faculty teaches DIFFERENT courses
-    # at the same time, requiring them to be in two places.
-    # Same faculty + same course + different sections in the SAME slot is
-    # EXPECTED (the sections are scheduled together deliberately).
+    # A real conflict is when a faculty is assigned to multiple courses OR
+    # multiple DIFFERENT rooms at the exact same time.
     for (day, period), entries in schedule.items():
         fac_map = defaultdict(list)
         for c in entries:
             if c['faculty'].lower() != 'nan':
                 fac_map[c['faculty']].append(c)
         for fac, clist in fac_map.items():
-            # Group by course_code: faculty can teach multiple sections
-            # of the same course at the same time (same room)
             courses_taught = set(c['course_code'] for c in clist)
-            rooms_used = set(c['room'] for c in clist
-                             if c['room'].lower() != 'nan')
-            if len(courses_taught) > 1 and len(rooms_used) > 1:
-                # Faculty is teaching genuinely different courses in
-                # different rooms → real conflict
+            rooms_used = set(c['room'] for c in clist if c['room'].lower() != 'nan')
+            
+            if len(rooms_used) > 1:
+                # Faculty is physically assigned to > 1 room at the same time
                 codes = ', '.join(sorted(courses_taught))
                 violations.append(
                     f"Faculty {fac} double-booked on {day} {period}: "
-                    f"{codes} in rooms {', '.join(sorted(rooms_used))}")
+                    f"Assigned to {codes} in multiple rooms simultaneously ({', '.join(sorted(rooms_used))})")
+            elif len(courses_taught) > 1 and len(rooms_used) <= 1:
+                # Faculty is teaching multiple genuinely different courses in the same room
+                codes = ', '.join(sorted(courses_taught))
+                violations.append(
+                    f"Faculty {fac} double-booked on {day} {period}: "
+                    f"Teaching multiple distinct courses ({codes}) in room {list(rooms_used)[0] if rooms_used else 'Unknown'}")
 
     # Check room double-booking
     # A real conflict is when the SAME room hosts DIFFERENT courses
@@ -1283,6 +1328,202 @@ def export_pdf(final_courses, pdf_file, slot_matrix):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def run_pipeline(input_file, reference_file=None, output_xlsx=None, output_pdf=None, use_db=True):
+    """Run the full timetable generation pipeline.
+
+    This is the core function called by both the CLI and the web UI.
+
+    Args:
+        input_file: Path to the slot assignment Excel file.
+        reference_file: Optional path to reference timetable (for slot matrix).
+        output_xlsx: Output Excel file path. Auto-generated if None.
+        output_pdf: Output PDF file path. Auto-generated if None.
+        use_db: Whether to mirror data to PostgreSQL.
+
+    Returns:
+        dict with keys:
+            'success': bool
+            'logs': list of log message strings
+            'violations': list of violation strings
+            'unresolved_count': int
+            'entry_count': int
+            'output_xlsx': str (file path)
+            'output_pdf': str (file path)
+            'final_courses': list (the in-memory course list)
+            'error': str (only if success=False)
+    """
+    import os
+    logs = []
+
+    def log(msg):
+        logs.append(msg)
+        print(msg)
+
+    # Default output paths
+    if output_xlsx is None:
+        base = os.path.splitext(os.path.basename(input_file))[0]
+        output_xlsx = f'Generated_{base}.xlsx'
+    if output_pdf is None:
+        base = os.path.splitext(os.path.basename(input_file))[0]
+        output_pdf = f'Generated_{base}.pdf'
+
+    total_steps = 10 if use_db else 8
+    step = 0
+
+    try:
+        log("=" * 60)
+        log("  University Timetable Generator")
+        if use_db:
+            log("  [Database Mode: PostgreSQL mirroring enabled]")
+        log("=" * 60)
+
+        # Step 0: Load config from DB
+        log("\n[*] Loading configuration from database...")
+        load_config_from_db()
+
+        # Step 1: Load slot matrix
+        step += 1
+        log(f"\n[{step}/{total_steps}] Loading slot matrix...")
+        slot_matrix = load_slot_matrix(reference_file)
+
+        # Step 2: Parse input
+        step += 1
+        log(f"\n[{step}/{total_steps}] Parsing input: {input_file}")
+        courses = parse_excel(input_file)
+        log(f"  Parsed {len(courses)} course entries.")
+
+        # Step 2.5 (DB mode): Mirror input to PostgreSQL
+        db = None
+        if use_db:
+            step += 1
+            log(f"\n[{step}/{total_steps}] Connecting to PostgreSQL...")
+            try:
+                from db_manager import DBManager
+                db = DBManager()
+            except Exception as e:
+                log(f"  ✗ Database connection failed: {e}")
+                log("  Continuing without database...")
+                db = None
+
+            if db:
+                step += 1
+                log(f"\n[{step}/{total_steps}] Mirroring input data to database...")
+                db.store_input_data(courses)
+
+        # Step 3: Build conflict graph
+        step += 1
+        log(f"\n[{step}/{total_steps}] Building conflict graph...")
+        nodes, sb_props, conflicts, roots = build_graph(courses)
+        log(f"  {len(roots)} superblocks, "
+            f"{sum(len(v) for v in conflicts.values()) // 2} conflict edges.")
+
+        # Step 4: Solve CSP
+        step += 1
+        log(f"\n[{step}/{total_steps}] Solving schedule (CSP + backtracking)...")
+        assignment, unresolved = solve_csp(roots, sb_props, conflicts, slot_matrix)
+
+        # Step 5: Soft constraints optimisation
+        step += 1
+        log(f"\n[{step}/{total_steps}] Optimising soft constraints...")
+        assignment = apply_soft_constraints(
+            assignment, sb_props, conflicts, slot_matrix)
+
+        # Step 6: Apply & validate
+        step += 1
+        log(f"\n[{step}/{total_steps}] Applying assignments & validating...")
+        final_courses = apply_assignments(courses, nodes, sb_props, assignment)
+
+        # Smart room assignment
+        step += 1
+        log(f"\n[{step}/{total_steps}] Assigning rooms (capacity-aware)...")
+        reassigned, unchanged = assign_rooms(final_courses, slot_matrix)
+        log(f"  ✓ {reassigned} courses reassigned to better-fit rooms")
+        log(f"  ✓ {unchanged} courses kept original room (adequate capacity)")
+
+        violations = validate(final_courses, slot_matrix)
+        violation_msgs = []
+        if violations:
+            log(f"  ⚠ {len(violations)} constraint violation(s):")
+            for v in violations:
+                log(f"    • {v}")
+                violation_msgs.append(str(v))
+        else:
+            log("  ✓ All hard constraints satisfied!")
+
+        # Detect unscheduled (Slot-Free) courses
+        unscheduled = []
+        seen_free = set()
+        for c in final_courses:
+            if c.get('final_slot') == 'Slot-Free' or c.get('original_slot') == 'Slot-Free':
+                key = (c['course_code'], c['sub_batch'], c.get('row_sec', ''))
+                if key not in seen_free:
+                    seen_free.add(key)
+                    unscheduled.append({
+                        'course_code': c['course_code'],
+                        'course_name': c.get('course_name', ''),
+                        'faculty': c.get('faculty', ''),
+                        'sub_batch': c['sub_batch'],
+                        'section': c.get('row_sec', ''),
+                    })
+        if unscheduled:
+            log(f"\n  ⚠ {len(unscheduled)} UNSCHEDULED course(s) in Slot-Free (no time/room assigned):")
+            for u in unscheduled:
+                log(f"    • {u['course_code']} ({u['course_name']}) — {u['faculty']} — {u['sub_batch']} {u['section']}")
+
+
+        # Step 6.5 (DB mode): Mirror results to PostgreSQL
+        if db:
+            log(f"\n[*] Writing results to database...")
+            db.store_results(final_courses, unresolved, slot_matrix, validated_violations=violation_msgs)
+
+        # Step 7: Export files
+        step += 1
+        log(f"\n[{step}/{total_steps}] Exporting...")
+        export_excel(final_courses, output_xlsx, slot_matrix, unresolved)
+        export_pdf(final_courses, output_pdf, slot_matrix)
+
+        # Close DB
+        if db:
+            db.close()
+
+        log("\n" + "=" * 60)
+        log("  Done! Output files:")
+        log(f"    Excel: {output_xlsx}")
+        log(f"    PDF:   {output_pdf}")
+        if unresolved:
+            log(f"    ⚠ {len(unresolved)} unresolved conflicts")
+        log("=" * 60)
+
+        return {
+            'success': True,
+            'logs': logs,
+            'violations': violation_msgs,
+            'unresolved_count': len(unresolved),
+            'unscheduled': unscheduled,
+            'entry_count': len(final_courses),
+            'output_xlsx': output_xlsx,
+            'output_pdf': output_pdf,
+            'final_courses': final_courses,
+        }
+
+    except Exception as e:
+        import traceback
+        log(f"\n✗ Pipeline failed: {e}")
+        log(traceback.format_exc())
+        return {
+            'success': False,
+            'logs': logs,
+            'error': str(e),
+            'violations': [],
+            'unresolved_count': 0,
+            'unscheduled': [],
+            'entry_count': 0,
+            'output_xlsx': output_xlsx,
+            'output_pdf': output_pdf,
+            'final_courses': [],
+        }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Generate a university timetable from slot assignments.')
@@ -1307,107 +1548,16 @@ def main():
         help='Enable PostgreSQL database mirroring (dual mode)')
     args = parser.parse_args()
 
-    # Determine step count based on mode
-    total_steps = 10 if args.use_db else 8
-    step = 0
+    result = run_pipeline(
+        input_file=args.input,
+        reference_file=args.reference,
+        output_xlsx=args.output_xlsx,
+        output_pdf=args.output_pdf,
+        use_db=args.use_db,
+    )
 
-    print("=" * 60)
-    print("  University Timetable Generator")
-    if args.use_db:
-        print("  [Database Mode: PostgreSQL mirroring enabled]")
-    print("=" * 60)
-
-    # Step 1: Load slot matrix
-    step += 1
-    print(f"\n[{step}/{total_steps}] Loading slot matrix...")
-    slot_matrix = load_slot_matrix(args.reference)
-
-    # Step 2: Parse input
-    step += 1
-    print(f"\n[{step}/{total_steps}] Parsing input: {args.input}")
-    courses = parse_excel(args.input)
-
-    # Step 2.5 (DB mode): Connect and mirror input data to PostgreSQL
-    db = None
-    if args.use_db:
-        step += 1
-        print(f"\n[{step}/{total_steps}] Connecting to PostgreSQL...")
-        try:
-            from db_manager import DBManager
-            db = DBManager()
-        except Exception as e:
-            print(f"  ✗ Database connection failed: {e}")
-            print("  Continuing without database...")
-            db = None
-
-        if db:
-            step += 1
-            print(f"\n[{step}/{total_steps}] Mirroring input data to database...")
-            db.store_input_data(courses)
-
-    # Step 3: Build conflict graph (UNCHANGED — works on in-memory courses)
-    step += 1
-    print(f"\n[{step}/{total_steps}] Building conflict graph...")
-    nodes, sb_props, conflicts, roots = build_graph(courses)
-    print(f"  {len(roots)} superblocks, "
-          f"{sum(len(v) for v in conflicts.values()) // 2} conflict edges.")
-
-    # Step 4: Solve CSP (UNCHANGED — works entirely in RAM)
-    step += 1
-    print(f"\n[{step}/{total_steps}] Solving schedule (CSP + backtracking)...")
-    assignment, unresolved = solve_csp(roots, sb_props, conflicts, slot_matrix)
-
-    # Step 5: Soft constraints optimisation (UNCHANGED)
-    step += 1
-    print(f"\n[{step}/{total_steps}] Optimising soft constraints...")
-    assignment = apply_soft_constraints(
-        assignment, sb_props, conflicts, slot_matrix)
-
-    # Step 6: Apply & validate (UNCHANGED)
-    step += 1
-    print(f"\n[{step}/{total_steps}] Applying assignments & validating...")
-    final_courses = apply_assignments(courses, nodes, sb_props, assignment)
-
-    # Smart room assignment — override Excel rooms with capacity-aware allocation
-    step += 1
-    print(f"\n[{step}/{total_steps}] Assigning rooms (capacity-aware)...")
-    reassigned, unchanged = assign_rooms(final_courses, slot_matrix)
-    print(f"  ✓ {reassigned} courses reassigned to better-fit rooms")
-    print(f"  ✓ {unchanged} courses kept original room (adequate capacity)")
-
-    violations = validate(final_courses, slot_matrix)
-    if violations:
-        print(f"  ⚠ {len(violations)} constraint violation(s):")
-        for v in violations:
-            print(f"    • {v}")
-    else:
-        print("  ✓ All hard constraints satisfied!")
-
-    # Step 6.5 (DB mode): Mirror results to PostgreSQL
-    if db:
-        print(f"\n[{step}/{total_steps}] Writing results to database...")
-        db.store_results(final_courses, unresolved, slot_matrix)
-
-    # Step 7: Export
-    step += 1
-    print(f"\n[{step}/{total_steps}] Exporting...")
-    export_excel(final_courses, args.output_xlsx, slot_matrix, unresolved)
-    export_pdf(final_courses, args.output_pdf, slot_matrix)
-
-    # Close database connection
-    if db:
-        db.close()
-
-    print("\n" + "=" * 60)
-    print("  Done! Output files:")
-    print(f"    Excel: {args.output_xlsx}")
-    print(f"    PDF:   {args.output_pdf}")
-    if args.use_db and db:
-        print(f"    DB:    timetable_generator_db (all tables populated)")
-    if unresolved:
-        print(f"    ⚠ {len(unresolved)} unresolved conflicts "
-              f"(see 'Conflicts' sheet in Excel)")
-    print("=" * 60)
+    if not result['success']:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -13,3 +13,6 @@ serviceAccountKey*.json
 
 # OS files
 .DS_Store
+
+# Uploaded Excel files (via admin UI)
+uploads/

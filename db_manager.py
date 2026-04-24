@@ -98,6 +98,322 @@ class DBManager:
             sys.exit(1)
 
     # =========================================================================
+    # CONFIG READERS: Read configuration from DB tables
+    # =========================================================================
+
+    def get_room_config(self):
+        """Read room capacities from DB. Returns dict: {room_number: capacity}."""
+        self.cur.execute("SELECT room_number, capacity FROM room WHERE capacity > 0 ORDER BY room_number")
+        return {row[0]: row[1] for row in self.cur.fetchall()}
+
+    def get_batch_config(self):
+        """Read batch strengths from DB. Returns dict: {program: total_headcount}."""
+        import re
+        self.cur.execute("""
+            SELECT sub_batch, section, headcount FROM student_batch
+            WHERE headcount > 0 ORDER BY sub_batch, section
+        """)
+        totals = {}
+        for sub_batch, section, headcount in self.cur.fetchall():
+            match = re.search(r'\(([^)]+)\)', sub_batch)
+            if match:
+                program = match.group(1).strip()
+                if program not in totals:
+                    totals[program] = 0
+                # Use max across sections as the per-section size
+                # For total, we'd sum unique sections but this is per-program
+                totals[program] = max(totals[program], headcount)
+        return totals
+
+    def get_section_config(self):
+        """Read section-level strength overrides. Returns dict: {(program, section): headcount}."""
+        import re
+        self.cur.execute("""
+            SELECT sub_batch, section, headcount FROM student_batch
+            WHERE headcount > 0 AND section != 'All' ORDER BY sub_batch, section
+        """)
+        result = {}
+        for sub_batch, section, headcount in self.cur.fetchall():
+            match = re.search(r'\(([^)]+)\)', sub_batch)
+            if match:
+                program = match.group(1).strip()
+                result[(program, section)] = headcount
+        return result
+
+    def get_elective_enrollment(self):
+        """Read elective enrollment from DB. Returns dict: {course_code: enrollment}."""
+        self.cur.execute("""
+            SELECT course_code, enrollment FROM elective_enrollment
+            WHERE semester = 'current' ORDER BY course_code
+        """)
+        return {row[0]: row[1] for row in self.cur.fetchall()}
+
+    def get_slot_matrix(self):
+        """Read slot matrix from DB. Returns dict: {day: {period_str: slot_group}}."""
+        self.cur.execute("""
+            SELECT day_of_week, start_time, end_time, slot_group
+            FROM time_slot ORDER BY day_of_week, start_time
+        """)
+        matrix = {}
+        for day, start, end, slot_group in self.cur.fetchall():
+            if day not in matrix:
+                matrix[day] = {}
+            start_str = start.strftime('%H:%M').lstrip('0') if hasattr(start, 'strftime') else str(start)[:5].lstrip('0')
+            end_str = end.strftime('%H:%M').lstrip('0') if hasattr(end, 'strftime') else str(end)[:5].lstrip('0')
+            period = f"{start_str} - {end_str}"
+            matrix[day][period] = slot_group
+        return matrix
+
+    def get_overlap_rules(self):
+        """Read batch overlap rules from DB. Returns list of tuples."""
+        self.cur.execute("""
+            SELECT batch_a, section_a, batch_b, section_b, description
+            FROM batch_overlap_rule ORDER BY rule_id
+        """)
+        return self.cur.fetchall()
+
+    # =========================================================================
+    # CONFIG WRITERS: CRUD operations for admin UI
+    # =========================================================================
+
+    def update_room_capacity(self, room_number, capacity):
+        """Update room capacity. Creates room if it doesn't exist."""
+        self.cur.execute("""
+            INSERT INTO room (room_number, capacity) VALUES (%s, %s)
+            ON CONFLICT (room_number) DO UPDATE SET capacity = EXCLUDED.capacity
+        """, (room_number, capacity))
+        self.conn.commit()
+
+    def delete_room(self, room_number):
+        """Delete a room."""
+        self.cur.execute("DELETE FROM room WHERE room_number = %s", (room_number,))
+        self.conn.commit()
+
+    def update_batch_headcount(self, batch_id, headcount):
+        """Update batch headcount."""
+        self.cur.execute("UPDATE student_batch SET headcount = %s WHERE batch_id = %s", (headcount, batch_id))
+        self.conn.commit()
+
+    def upsert_elective_enrollment(self, course_code, enrollment):
+        """Insert or update elective enrollment."""
+        self.cur.execute("""
+            INSERT INTO elective_enrollment (course_code, enrollment)
+            VALUES (%s, %s)
+            ON CONFLICT (course_code, semester) DO UPDATE SET enrollment = EXCLUDED.enrollment
+        """, (course_code, enrollment))
+        self.conn.commit()
+
+    def delete_elective_enrollment(self, course_code):
+        """Delete elective enrollment entry."""
+        self.cur.execute("DELETE FROM elective_enrollment WHERE course_code = %s AND semester = 'current'", (course_code,))
+        self.conn.commit()
+
+    def upsert_overlap_rule(self, batch_a, section_a, batch_b, section_b, description=''):
+        """Insert a new batch overlap rule."""
+        self.cur.execute("""
+            INSERT INTO batch_overlap_rule (batch_a, section_a, batch_b, section_b, description)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (batch_a, section_a, batch_b, section_b, description))
+        self.conn.commit()
+
+    def delete_overlap_rule(self, rule_id):
+        """Delete an overlap rule."""
+        self.cur.execute("DELETE FROM batch_overlap_rule WHERE rule_id = %s", (rule_id,))
+        self.conn.commit()
+
+    def update_slot_group(self, slot_id, slot_group):
+        """Update the slot group for a time slot."""
+        self.cur.execute("UPDATE time_slot SET slot_group = %s WHERE slot_id = %s", (slot_group, slot_id))
+        self.conn.commit()
+
+    def add_time_slot(self, day_of_week, start_time, end_time, slot_group):
+        """Add a new time slot."""
+        self.cur.execute("""
+            INSERT INTO time_slot (day_of_week, start_time, end_time, slot_group)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (day_of_week, start_time) DO UPDATE SET
+                end_time = EXCLUDED.end_time, slot_group = EXCLUDED.slot_group
+        """, (day_of_week, start_time, end_time, slot_group))
+        self.conn.commit()
+
+    def delete_time_slot(self, slot_id):
+        """Delete a time slot."""
+        self.cur.execute("DELETE FROM time_slot WHERE slot_id = %s", (slot_id,))
+        self.conn.commit()
+
+    # =========================================================================
+    # SNAPSHOT METHODS: Timetable versioning
+    # =========================================================================
+
+    def save_snapshot(self, label, semester='', source_file='', notes=''):
+        """Save the current master_timetable as a JSONB snapshot.
+
+        Captures the full rendered timetable (via v_master_timetable view)
+        as a JSON array and stores it in the timetable_snapshot table.
+        """
+        import json
+
+        # Capture current timetable state from the view
+        self.cur.execute("""
+            SELECT
+                mt.timetable_id,
+                c.course_code, c.course_name, c.course_type,
+                f.short_name AS faculty,
+                sb.sub_batch, sb.section,
+                r.room_number,
+                ts.day_of_week, ts.start_time::text, ts.end_time::text, ts.slot_group,
+                mt.is_moved, mt.original_slot_group
+            FROM master_timetable mt
+            JOIN faculty_course_map fcm ON mt.assignment_id = fcm.assignment_id
+            JOIN course c ON fcm.course_id = c.course_id
+            JOIN faculty f ON fcm.faculty_id = f.faculty_id
+            JOIN student_batch sb ON mt.batch_id = sb.batch_id
+            LEFT JOIN room r ON mt.room_id = r.room_id
+            JOIN time_slot ts ON mt.slot_id = ts.slot_id
+            ORDER BY ts.day_of_week, ts.start_time
+        """)
+        columns = [desc[0] for desc in self.cur.description]
+        rows = self.cur.fetchall()
+        data = [dict(zip(columns, row)) for row in rows]
+
+        # Count violations
+        self.cur.execute("SELECT COUNT(*) FROM constraint_violation_log")
+        violation_count = self.cur.fetchone()[0]
+
+        self.cur.execute("""
+            INSERT INTO timetable_snapshot
+                (label, semester, source_file, notes, entry_count, violation_count, snapshot_data)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING snapshot_id
+        """, (label, semester, source_file, notes, len(data), violation_count, json.dumps(data)))
+        snapshot_id = self.cur.fetchone()[0]
+        self.conn.commit()
+        return snapshot_id
+
+    def list_snapshots(self):
+        """List all snapshots (without the heavy JSONB data)."""
+        self.cur.execute("""
+            SELECT snapshot_id, label, semester, source_file, notes,
+                   entry_count, violation_count, created_at
+            FROM timetable_snapshot
+            ORDER BY created_at DESC
+        """)
+        return self.cur.fetchall()
+
+    def get_snapshot(self, snapshot_id):
+        """Get a single snapshot including its data."""
+        self.cur.execute("""
+            SELECT snapshot_id, label, semester, source_file, notes,
+                   entry_count, violation_count, created_at, snapshot_data
+            FROM timetable_snapshot
+            WHERE snapshot_id = %s
+        """, (snapshot_id,))
+        return self.cur.fetchone()
+
+    def restore_snapshot(self, snapshot_id):
+        """Restore a snapshot as the active timetable.
+
+        Clears the current master_timetable and re-inserts entries from the
+        snapshot. Requires that referenced courses, faculties, batches, rooms,
+        and time_slots still exist in the database.
+        """
+        import json
+
+        row = self.get_snapshot(snapshot_id)
+        if not row:
+            raise ValueError(f"Snapshot {snapshot_id} not found")
+
+        data = row[8]  # snapshot_data (JSONB auto-parsed by psycopg2)
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        # Clear current timetable
+        self.cur.execute("TRUNCATE master_timetable CASCADE;")
+        self.cur.execute("TRUNCATE constraint_violation_log CASCADE;")
+
+        restored = 0
+        skipped = 0
+        for entry in data:
+            try:
+                # Look up foreign keys
+                self.cur.execute("SELECT faculty_id FROM faculty WHERE short_name = %s", (entry['faculty'],))
+                fac_row = self.cur.fetchone()
+                if not fac_row:
+                    skipped += 1
+                    continue
+                faculty_id = fac_row[0]
+
+                self.cur.execute("SELECT course_id FROM course WHERE course_code = %s", (entry['course_code'],))
+                course_row = self.cur.fetchone()
+                if not course_row:
+                    skipped += 1
+                    continue
+                course_id = course_row[0]
+
+                # Get or create faculty-course assignment
+                self.cur.execute("""
+                    INSERT INTO faculty_course_map (faculty_id, course_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (faculty_id, course_id) DO NOTHING
+                    RETURNING assignment_id
+                """, (faculty_id, course_id))
+                arow = self.cur.fetchone()
+                if not arow:
+                    self.cur.execute(
+                        "SELECT assignment_id FROM faculty_course_map WHERE faculty_id=%s AND course_id=%s",
+                        (faculty_id, course_id))
+                    arow = self.cur.fetchone()
+                assignment_id = arow[0]
+
+                # Batch
+                self.cur.execute(
+                    "SELECT batch_id FROM student_batch WHERE sub_batch=%s AND section=%s",
+                    (entry['sub_batch'], entry['section']))
+                batch_row = self.cur.fetchone()
+                if not batch_row:
+                    skipped += 1
+                    continue
+                batch_id = batch_row[0]
+
+                # Room
+                room_id = None
+                if entry.get('room_number'):
+                    self.cur.execute("SELECT room_id FROM room WHERE room_number=%s", (entry['room_number'],))
+                    rrow = self.cur.fetchone()
+                    if rrow:
+                        room_id = rrow[0]
+
+                # Slot
+                self.cur.execute(
+                    "SELECT slot_id FROM time_slot WHERE day_of_week=%s AND start_time=%s::time",
+                    (entry['day_of_week'], entry['start_time']))
+                srow = self.cur.fetchone()
+                if not srow:
+                    skipped += 1
+                    continue
+                slot_id = srow[0]
+
+                self.cur.execute("""
+                    INSERT INTO master_timetable
+                        (assignment_id, batch_id, room_id, slot_id, is_moved, original_slot_group)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (assignment_id, batch_id, slot_id) DO NOTHING
+                """, (assignment_id, batch_id, room_id, slot_id,
+                      entry.get('is_moved', False), entry.get('original_slot_group')))
+                restored += 1
+            except Exception:
+                skipped += 1
+                continue
+
+        self.conn.commit()
+        return restored, skipped
+
+    def delete_snapshot(self, snapshot_id):
+        """Delete a snapshot."""
+        self.cur.execute("DELETE FROM timetable_snapshot WHERE snapshot_id = %s", (snapshot_id,))
+        self.conn.commit()
+
+    # =========================================================================
     # STORE INPUT DATA: Excel courses → PostgreSQL entity tables
     # =========================================================================
 
@@ -389,7 +705,7 @@ class DBManager:
     # STORE RESULTS: Solver output → Master_Timetable + Violation Log
     # =========================================================================
 
-    def store_results(self, final_courses, unresolved, slot_matrix=None):
+    def store_results(self, final_courses, unresolved, slot_matrix=None, validated_violations=None):
         """
         Take the in-memory solver output and write it to PostgreSQL.
 
@@ -397,6 +713,7 @@ class DBManager:
             final_courses: List of course dicts with 'final_slot' added by solver
             unresolved: List of unresolved conflict dicts from CSP solver
             slot_matrix: Dict mapping day → {period → slot_group}
+            validated_violations: List of violation strings computed by validate()
         """
         try:
             # Clear previous results
@@ -516,11 +833,21 @@ class DBManager:
                     (None, 'WARNING', violation_detail)
                 )
                 violations_logged += 1
+            # Log manual violations from validation step
+            if validated_violations:
+                for v in validated_violations:
+                    self.cur.execute(
+                        """INSERT INTO constraint_violation_log
+                           (constraint_id, severity, violation_detail)
+                           VALUES (%s, %s, %s)""",
+                        (None, 'ERROR', v)
+                    )
+                    violations_logged += 1
 
             self.conn.commit()
             self._log(f"  ✓ {inserted} timetable entries written to Master_Timetable")
             if deduped:
-                self._log(f"  ✓ {deduped} duplicate entries de-duplicated (same faculty-course for same batch/slot)")
+                self._log(f"  ✓ {deduped} duplicate entries de-duplicated")
             if violations_logged:
                 self._log(f"  ⚠ {violations_logged} constraint violations logged")
             else:

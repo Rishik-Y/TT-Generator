@@ -5,6 +5,9 @@
 -- ============================================================================
 
 -- Drop tables in reverse dependency order (for clean re-runs)
+DROP TABLE IF EXISTS timetable_snapshot CASCADE;
+DROP TABLE IF EXISTS batch_overlap_rule CASCADE;
+DROP TABLE IF EXISTS elective_enrollment CASCADE;
 DROP TABLE IF EXISTS user_role CASCADE;
 DROP TABLE IF EXISTS constraint_violation_log CASCADE;
 DROP TABLE IF EXISTS master_timetable CASCADE;
@@ -250,6 +253,57 @@ COMMENT ON TABLE user_role IS 'Maps Firebase Auth UIDs to application roles (ADM
 COMMENT ON COLUMN user_role.uid IS 'Firebase UID — primary key, set during account seeding';
 COMMENT ON COLUMN user_role.faculty_id IS 'Links FACULTY users to their faculty record for data scoping';
 COMMENT ON COLUMN user_role.password_changed IS 'FALSE = must change password on next login; TRUE = normal access';
+
+-- ============================================================================
+-- 12. ELECTIVE ENROLLMENT TABLE
+-- Tracks actual enrollment numbers for elective courses (overrides batch size).
+-- ============================================================================
+CREATE TABLE elective_enrollment (
+    enrollment_id SERIAL PRIMARY KEY,
+    course_code   VARCHAR(20) NOT NULL,
+    enrollment    INT NOT NULL DEFAULT 0,
+    semester      VARCHAR(20) DEFAULT 'current',
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_elective_course UNIQUE (course_code, semester),
+    CONSTRAINT chk_enrollment CHECK (enrollment >= 0)
+);
+
+COMMENT ON TABLE elective_enrollment IS 'Actual enrollment numbers for elective courses — overrides batch-size heuristic';
+
+-- ============================================================================
+-- 13. BATCH OVERLAP RULE TABLE
+-- Defines which student batches share students (e.g., ICT+CS minors in ICT Sec B).
+-- ============================================================================
+CREATE TABLE batch_overlap_rule (
+    rule_id     SERIAL PRIMARY KEY,
+    batch_a     VARCHAR(80) NOT NULL,
+    section_a   VARCHAR(20) NOT NULL DEFAULT 'All',
+    batch_b     VARCHAR(80) NOT NULL,
+    section_b   VARCHAR(20) NOT NULL DEFAULT 'All',
+    description VARCHAR(200),
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+COMMENT ON TABLE batch_overlap_rule IS 'Defines student group overlaps — batch_a students also attend batch_b classes';
+
+-- ============================================================================
+-- 14. TIMETABLE SNAPSHOT TABLE
+-- Stores complete timetable snapshots for versioning and history.
+-- ============================================================================
+CREATE TABLE timetable_snapshot (
+    snapshot_id     SERIAL PRIMARY KEY,
+    label           VARCHAR(100) NOT NULL,
+    semester        VARCHAR(50),
+    notes           TEXT,
+    source_file     VARCHAR(200),
+    entry_count     INT DEFAULT 0,
+    violation_count INT DEFAULT 0,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    snapshot_data   JSONB NOT NULL
+);
+
+COMMENT ON TABLE timetable_snapshot IS 'Complete timetable snapshots for versioning — stores full grid as JSONB';
 
 -- ============================================================================
 -- INDEXES (Performance Optimization)

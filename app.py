@@ -543,6 +543,28 @@ tr:hover td { background: var(--bg-card-hover); }
     border-color: var(--accent-red);
 }
 
+.tab-btn {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: 'Inter', sans-serif;
+}
+.tab-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--accent-blue);
+}
+.tab-btn.active {
+    background: rgba(79, 143, 255, 0.15);
+    color: var(--accent-blue);
+    border-color: var(--accent-blue);
+}
+
 .badge-core {
     background: rgba(6, 182, 212, 0.15);
     color: var(--accent-cyan);
@@ -708,13 +730,16 @@ def build_nav(user, active_page=''):
     if user['role'] == 'ADMIN':
         pages = [
             ('admin_dashboard', 'dashboard', 'Dashboard'),
-            ('admin_timetable', 'timetable', 'Master Timetable'),
-            ('admin_faculty', 'faculty', 'Faculty Schedule'),
-            ('admin_rooms', 'rooms', 'Room Utilization'),
+            ('admin_generate', 'generate', 'Generate'),
+            ('admin_timetable', 'timetable', 'Timetable'),
+            ('admin_history', 'history', 'History'),
+            ('admin_faculty', 'faculty', 'Faculty'),
+            ('admin_rooms', 'rooms', 'Rooms'),
             ('admin_constraints', 'constraints', 'Constraints'),
-            ('admin_violations', 'violations', 'Violation Log'),
-            ('admin_faculty_pdfs', 'pdfs', 'Faculty PDFs'),
-            ('admin_manage_users', 'users', 'Manage Users'),
+            ('admin_violations', 'violations', 'Violations'),
+            ('admin_faculty_pdfs', 'pdfs', 'PDFs'),
+            ('admin_manage_users', 'users', 'Users'),
+            ('admin_configuration', 'config', 'Config'),
         ]
     else:
         pages = [
@@ -1252,6 +1277,21 @@ def admin_dashboard():
         stats = db.get_stats()
         constraints = db.get_constraints()
         constraints = format_entries(constraints)
+
+        # Check for unscheduled (Slot-Free) courses
+        db.cur.execute("""
+            SELECT DISTINCT c.course_code, c.course_name, f.short_name AS faculty,
+                   sb.sub_batch, sb.section
+            FROM master_timetable mt
+            JOIN faculty_course_map fcm ON mt.assignment_id = fcm.assignment_id
+            JOIN course c ON fcm.course_id = c.course_id
+            JOIN faculty f ON fcm.faculty_id = f.faculty_id
+            JOIN student_batch sb ON mt.batch_id = sb.batch_id
+            JOIN time_slot ts ON mt.slot_id = ts.slot_id
+            WHERE ts.slot_group = 'Slot-Free'
+            ORDER BY c.course_code
+        """)
+        unscheduled = db.cur.fetchall()
     finally:
         db.close()
 
@@ -1265,6 +1305,34 @@ def admin_dashboard():
             <div class="stat-label">{label}</div>
         </div>'''
     stats_html += '</div>'
+
+    # Unscheduled courses alert
+    unsched_html = ''
+    if unscheduled:
+        unsched_rows = ''
+        for code, name, faculty, batch, section in unscheduled:
+            unsched_rows += f'''
+                <tr>
+                    <td style="color:#f59e0b;font-weight:600;">{code}</td>
+                    <td>{name}</td>
+                    <td>{faculty}</td>
+                    <td>{batch} {section}</td>
+                </tr>'''
+        unsched_html = f'''
+        <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:12px;padding:1.25rem;margin-bottom:1.5rem;">
+            <h3 style="color:#f59e0b;margin:0 0 0.75rem 0;font-size:1rem;">
+                ⚠️ {len(unscheduled)} Unscheduled Course(s) — Slot-Free (no time/room assigned)
+            </h3>
+            <div class="table-scroll">
+                <table style="margin:0;">
+                    <thead><tr><th>Code</th><th>Course</th><th>Faculty</th><th>Batch</th></tr></thead>
+                    <tbody>{unsched_rows}</tbody>
+                </table>
+            </div>
+            <p style="margin:0.75rem 0 0;font-size:0.78rem;color:var(--text-muted);">
+                These courses were marked as "Slot-Free" in the input Excel. They need manual scheduling.
+            </p>
+        </div>'''
 
     # Constraints table
     constraints_html = '''
@@ -1304,6 +1372,7 @@ def admin_dashboard():
     content = f'''
     <h1><span class="icon">📊</span>Dashboard</h1>
     <p class="subtitle">University Timetable Generator — Database Overview</p>
+    {unsched_html}
     {stats_html}
     {constraints_html}
     '''
@@ -2348,6 +2417,920 @@ def admin_manage_users():
     '''
 
     return page_shell('Manage Users', get_current_user(), 'users', content)
+
+
+# ---------------------------------------------------------------------------
+# Admin Generate Timetable Page — Upload Excel & Run Pipeline
+# ---------------------------------------------------------------------------
+
+@app.route('/admin/generate')
+@admin_required
+def admin_generate():
+    """Admin page to upload slot Excel and generate timetable."""
+    content = f'''
+    <h1><span class="icon">🚀</span>Generate Timetable</h1>
+    <p class="subtitle">Upload the slot assignment Excel file to generate a new timetable</p>
+
+    <div class="table-container" style="margin-bottom: 2rem;">
+        <div class="table-header">
+            <h2>📤 Upload & Generate</h2>
+        </div>
+        <div style="padding: 1.5rem;">
+            <div id="gen-error" style="display:none;margin-bottom:1rem;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:var(--accent-red);padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;"></div>
+            <div id="gen-success" style="display:none;margin-bottom:1rem;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:var(--accent-green);padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;"></div>
+
+            <form id="generate-form" onsubmit="generateTimetable(event)" enctype="multipart/form-data">
+                <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem;">
+                    <div class="filter-group">
+                        <label>Slot Assignment Excel *</label>
+                        <input type="file" id="slot-file" accept=".xlsx,.xls" required
+                               style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:0.5rem;border-radius:6px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Reference Timetable (optional)</label>
+                        <input type="file" id="ref-file" accept=".xlsx,.xls"
+                               style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:0.5rem;border-radius:6px;">
+                    </div>
+                </div>
+                <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem;">
+                    <div class="filter-group">
+                        <label>Version Label *</label>
+                        <input type="text" id="gen-label" placeholder="e.g. Winter 2025-26 v1" required style="min-width:220px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Semester</label>
+                        <input type="text" id="gen-semester" placeholder="e.g. Win 2025-26" style="min-width:180px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Notes (optional)</label>
+                        <input type="text" id="gen-notes" placeholder="Any notes..." style="min-width:200px;">
+                    </div>
+                </div>
+                <button type="submit" id="gen-btn" class="btn btn-green" style="font-size:1rem;padding:0.6rem 2rem;">
+                    🚀 Generate Timetable
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Progress Log -->
+    <div id="log-container" class="table-container" style="display:none;">
+        <div class="table-header">
+            <h2>📋 Generation Log</h2>
+            <span id="gen-status" class="table-count">Running...</span>
+        </div>
+        <div style="padding:1rem;">
+            <pre id="gen-log" style="background:var(--bg-primary);color:var(--accent-green);font-family:monospace;font-size:0.78rem;padding:1rem;border-radius:8px;border:1px solid var(--border);max-height:400px;overflow-y:auto;white-space:pre-wrap;line-height:1.6;"></pre>
+        </div>
+    </div>
+
+    <!-- Results -->
+    <div id="result-container" class="table-container" style="display:none;margin-top:1rem;">
+        <div class="table-header">
+            <h2>✅ Results</h2>
+        </div>
+        <div style="padding:1.5rem;" id="result-content"></div>
+    </div>
+
+    <script>
+    async function generateTimetable(e) {{
+        e.preventDefault();
+        var btn = document.getElementById('gen-btn');
+        var logContainer = document.getElementById('log-container');
+        var logPre = document.getElementById('gen-log');
+        var resultContainer = document.getElementById('result-container');
+        var errorDiv = document.getElementById('gen-error');
+        var successDiv = document.getElementById('gen-success');
+
+        errorDiv.style.display = 'none';
+        successDiv.style.display = 'none';
+        resultContainer.style.display = 'none';
+
+        var slotFile = document.getElementById('slot-file').files[0];
+        if (!slotFile) {{
+            errorDiv.textContent = 'Please select a slot Excel file';
+            errorDiv.style.display = 'block';
+            return;
+        }}
+
+        btn.disabled = true;
+        btn.textContent = 'Generating...';
+        logContainer.style.display = 'block';
+        logPre.textContent = 'Starting generation...\\n';
+        document.getElementById('gen-status').textContent = 'Running...';
+
+        var formData = new FormData();
+        formData.append('slot_file', slotFile);
+        var refFile = document.getElementById('ref-file').files[0];
+        if (refFile) formData.append('ref_file', refFile);
+        formData.append('label', document.getElementById('gen-label').value);
+        formData.append('semester', document.getElementById('gen-semester').value);
+        formData.append('notes', document.getElementById('gen-notes').value);
+
+        try {{
+            var resp = await fetch('/api/admin/generate', {{
+                method: 'POST',
+                body: formData
+            }});
+            var data = await resp.json();
+
+            // Show logs
+            logPre.textContent = data.logs.join('\\n');
+            logPre.scrollTop = logPre.scrollHeight;
+
+            if (data.success) {{
+                document.getElementById('gen-status').textContent = '✅ Complete';
+                successDiv.textContent = 'Timetable generated and saved as version: ' + document.getElementById('gen-label').value;
+                successDiv.style.display = 'block';
+
+                // Show results
+                resultContainer.style.display = 'block';
+                var html = '<div style="display:flex;gap:2rem;flex-wrap:wrap;">';
+                html += '<div><strong>Entries:</strong> ' + data.entry_count + '</div>';
+                html += '<div><strong>Violations:</strong> ' + data.violation_count + '</div>';
+                html += '<div><strong>Unresolved:</strong> ' + data.unresolved_count + '</div>';
+                html += '<div><strong>Snapshot ID:</strong> #' + data.snapshot_id + '</div>';
+                html += '</div>';
+                html += '<div style="margin-top:1rem;display:flex;gap:1rem;">';
+                if (data.output_pdf) {{
+                    html += '<a href="/admin/download/' + encodeURIComponent(data.output_pdf) + '" class="btn btn-green">📄 Download PDF</a>';
+                }}
+                if (data.output_xlsx) {{
+                    html += '<a href="/admin/download/' + encodeURIComponent(data.output_xlsx) + '" class="btn" style="background:rgba(79,143,255,0.15);color:var(--accent-blue);border:1px solid var(--accent-blue);">📊 Download Excel</a>';
+                }}
+                html += '<a href="/admin/timetable" class="btn" style="background:rgba(168,85,247,0.15);color:var(--accent-purple);border:1px solid var(--accent-purple);">📅 View Timetable</a>';
+                html += '</div>';
+
+                // Show unscheduled courses warning
+                if (data.unscheduled && data.unscheduled.length > 0) {{
+                    html += '<div style="margin-top:1.5rem;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3);border-radius:8px;padding:1rem;">';
+                    html += '<h3 style="color:#f59e0b;margin:0 0 0.75rem 0;font-size:0.95rem;">⚠️ ' + data.unscheduled.length + ' Unscheduled Course(s) — No time/room assigned</h3>';
+                    html += '<table style="width:100%;font-size:0.8rem;"><thead><tr><th style="text-align:left;padding:0.3rem;">Code</th><th style="text-align:left;padding:0.3rem;">Course</th><th style="text-align:left;padding:0.3rem;">Faculty</th><th style="text-align:left;padding:0.3rem;">Batch</th></tr></thead><tbody>';
+                    data.unscheduled.forEach(function(u) {{
+                        html += '<tr><td style="padding:0.3rem;color:var(--accent-yellow);font-weight:600;">' + u.course_code + '</td>';
+                        html += '<td style="padding:0.3rem;">' + u.course_name + '</td>';
+                        html += '<td style="padding:0.3rem;">' + u.faculty + '</td>';
+                        html += '<td style="padding:0.3rem;">' + u.sub_batch + ' ' + u.section + '</td></tr>';
+                    }});
+                    html += '</tbody></table>';
+                    html += '<p style="margin:0.75rem 0 0;font-size:0.78rem;color:var(--text-muted);">These courses are in "Slot-Free" in the input Excel and need manual scheduling.</p>';
+                    html += '</div>';
+                }}
+
+                document.getElementById('result-content').innerHTML = html;
+            }} else {{
+                document.getElementById('gen-status').textContent = '❌ Failed';
+                errorDiv.textContent = data.error || 'Generation failed';
+                errorDiv.style.display = 'block';
+            }}
+        }} catch (err) {{
+            errorDiv.textContent = 'Network error: ' + err.message;
+            errorDiv.style.display = 'block';
+            document.getElementById('gen-status').textContent = '❌ Error';
+        }}
+
+        btn.disabled = false;
+        btn.textContent = '🚀 Generate Timetable';
+    }}
+    </script>
+    '''
+    return page_shell('Generate Timetable', get_current_user(), 'generate', content)
+
+
+@app.route('/api/admin/generate', methods=['POST'])
+@admin_required
+def api_admin_generate():
+    """Handle Excel upload and run the timetable generation pipeline."""
+    import os
+    from werkzeug.utils import secure_filename
+
+    upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+    os.makedirs(upload_dir, exist_ok=True)
+
+    # Save uploaded files
+    slot_file = request.files.get('slot_file')
+    if not slot_file:
+        return jsonify({'success': False, 'error': 'No slot file uploaded', 'logs': []}), 400
+
+    slot_filename = secure_filename(slot_file.filename)
+    slot_path = os.path.join(upload_dir, slot_filename)
+    slot_file.save(slot_path)
+
+    ref_path = None
+    ref_file = request.files.get('ref_file')
+    if ref_file and ref_file.filename:
+        ref_filename = secure_filename(ref_file.filename)
+        ref_path = os.path.join(upload_dir, ref_filename)
+        ref_file.save(ref_path)
+
+    label = request.form.get('label', 'Generated Timetable')
+    semester = request.form.get('semester', '')
+    notes = request.form.get('notes', '')
+
+    # Output files in uploads dir
+    out_base = os.path.splitext(slot_filename)[0]
+    output_xlsx = os.path.join(upload_dir, f'Generated_{out_base}.xlsx')
+    output_pdf = os.path.join(upload_dir, f'Generated_{out_base}.pdf')
+
+    try:
+        from generate_timetable import run_pipeline
+        result = run_pipeline(
+            input_file=slot_path,
+            reference_file=ref_path,
+            output_xlsx=output_xlsx,
+            output_pdf=output_pdf,
+            use_db=True,
+        )
+
+        # Auto-save snapshot
+        snapshot_id = None
+        if result['success']:
+            try:
+                db = DBManager(quiet=True)
+                snapshot_id = db.save_snapshot(
+                    label=label,
+                    semester=semester,
+                    source_file=slot_filename,
+                    notes=notes,
+                )
+                db.close()
+            except Exception as snap_err:
+                result['logs'].append(f"⚠ Snapshot save failed: {snap_err}")
+
+        return jsonify({
+            'success': result['success'],
+            'logs': result['logs'],
+            'entry_count': result['entry_count'],
+            'violation_count': len(result['violations']),
+            'unresolved_count': result['unresolved_count'],
+            'unscheduled': result.get('unscheduled', []),
+            'output_xlsx': os.path.basename(output_xlsx) if result['success'] else None,
+            'output_pdf': os.path.basename(output_pdf) if result['success'] else None,
+            'snapshot_id': snapshot_id,
+            'error': result.get('error', ''),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'logs': [traceback.format_exc()],
+        }), 500
+
+
+@app.route('/admin/download/<path:filename>')
+@admin_required
+def admin_download(filename):
+    """Serve generated files for download."""
+    import os
+    from flask import send_from_directory
+    upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+    return send_from_directory(upload_dir, filename, as_attachment=True)
+
+
+# ---------------------------------------------------------------------------
+# Admin History Page — Timetable Versioning
+# ---------------------------------------------------------------------------
+
+@app.route('/admin/history')
+@admin_required
+def admin_history():
+    """Admin page to view and manage timetable snapshots."""
+    db = DBManager(quiet=True)
+    try:
+        snapshots = db.list_snapshots()
+    finally:
+        db.close()
+
+    rows = ''
+    for sid, label, semester, source, notes, entries, violations, created in snapshots:
+        created_str = created.strftime('%Y-%m-%d %H:%M') if created else '—'
+        notes_short = (notes[:60] + '...') if notes and len(notes) > 60 else (notes or '—')
+        viol_badge = f'<span class="badge badge-inactive">{violations}</span>' if violations > 0 else '<span class="badge badge-active">0</span>'
+        rows += f'''
+            <tr>
+                <td>#{sid}</td>
+                <td><strong>{label}</strong></td>
+                <td>{semester or "—"}</td>
+                <td>{source or "—"}</td>
+                <td>{entries}</td>
+                <td>{viol_badge}</td>
+                <td>{created_str}</td>
+                <td style="white-space:nowrap;">
+                    <button class="btn" style="font-size:0.7rem;padding:0.25rem 0.6rem;background:rgba(16,185,129,0.15);color:var(--accent-green);border:1px solid var(--accent-green);border-radius:6px;cursor:pointer;" onclick="restoreSnapshot({sid}, '{label.replace(chr(39), '')}')">♻️ Restore</button>
+                    <button class="btn-delete" style="font-size:0.7rem;padding:0.25rem 0.6rem;" onclick="deleteSnapshot({sid})">Delete</button>
+                </td>
+            </tr>'''
+
+    content = f'''
+    <h1><span class="icon">📜</span>Timetable History</h1>
+    <p class="subtitle">Browse, restore, or delete previous timetable versions</p>
+
+    <div id="hist-msg" style="display:none;padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;margin-bottom:1rem;"></div>
+
+    <div class="table-container">
+        <div class="table-header">
+            <h2>📋 Saved Versions</h2>
+            <span class="table-count">{len(snapshots)} snapshots</span>
+        </div>
+        <div class="table-scroll">
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Label</th>
+                        <th>Semester</th>
+                        <th>Source File</th>
+                        <th>Entries</th>
+                        <th>Violations</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows if rows else '<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:2rem;">No snapshots yet. Generate a timetable to create the first version.</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+    function restoreSnapshot(sid, label) {{
+        if (!confirm('Restore "' + label + '" as the active timetable?\\n\\nThis will replace the current timetable.')) return;
+        fetch('/api/admin/history/restore', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ snapshot_id: sid }})
+        }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+            var el = document.getElementById('hist-msg');
+            if (d.success) {{
+                el.textContent = 'Restored! ' + d.restored + ' entries loaded, ' + d.skipped + ' skipped.';
+                el.style.background = 'rgba(16,185,129,0.1)';
+                el.style.border = '1px solid rgba(16,185,129,0.3)';
+                el.style.color = 'var(--accent-green)';
+            }} else {{
+                el.textContent = 'Restore failed: ' + d.error;
+                el.style.background = 'rgba(239,68,68,0.1)';
+                el.style.border = '1px solid rgba(239,68,68,0.3)';
+                el.style.color = 'var(--accent-red)';
+            }}
+            el.style.display = 'block';
+        }});
+    }}
+
+    function deleteSnapshot(sid) {{
+        if (!confirm('Delete this snapshot permanently?')) return;
+        fetch('/api/admin/history/delete', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ snapshot_id: sid }})
+        }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+            if (d.success) location.reload();
+            else alert('Delete failed: ' + d.error);
+        }});
+    }}
+    </script>
+    '''
+    return page_shell('Timetable History', get_current_user(), 'history', content)
+
+
+@app.route('/api/admin/history/restore', methods=['POST'])
+@admin_required
+def api_history_restore():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        restored, skipped = db.restore_snapshot(data['snapshot_id'])
+        return jsonify({'success': True, 'restored': restored, 'skipped': skipped})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/history/delete', methods=['POST'])
+@admin_required
+def api_history_delete():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.delete_snapshot(data['snapshot_id'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Admin Configuration Page — Rooms, Batches, Electives, Slots, Overlaps
+# ---------------------------------------------------------------------------
+
+@app.route('/admin/configuration')
+@admin_required
+def admin_configuration():
+    """Admin page to configure rooms, batches, electives, slots, and overlap rules."""
+    db = DBManager(quiet=True)
+    try:
+        # Rooms
+        db.cur.execute("SELECT room_id, room_number, room_type, capacity FROM room ORDER BY room_number")
+        rooms = db.cur.fetchall()
+
+        # Batches with headcounts
+        db.cur.execute("SELECT batch_id, sub_batch, section, headcount FROM student_batch ORDER BY sub_batch, section")
+        batches = db.cur.fetchall()
+
+        # Elective enrollments
+        db.cur.execute("""
+            SELECT ee.enrollment_id, ee.course_code, COALESCE(c.course_name, '—'), ee.enrollment
+            FROM elective_enrollment ee
+            LEFT JOIN course c ON ee.course_code = c.course_code
+            WHERE ee.semester = 'current'
+            ORDER BY ee.course_code
+        """)
+        electives = db.cur.fetchall()
+
+        # Slot matrix
+        db.cur.execute("SELECT slot_id, day_of_week, start_time, end_time, slot_group FROM time_slot ORDER BY day_of_week, start_time")
+        slots = db.cur.fetchall()
+
+        # Overlap rules
+        db.cur.execute("SELECT rule_id, batch_a, section_a, batch_b, section_b, description FROM batch_overlap_rule ORDER BY rule_id")
+        overlaps = db.cur.fetchall()
+    finally:
+        db.close()
+
+    # Build Rooms table
+    rooms_rows = ''
+    for rid, rnum, rtype, cap in rooms:
+        rooms_rows += f'''
+            <tr>
+                <td><strong>{rnum}</strong></td>
+                <td>{rtype or "Lecture Hall"}</td>
+                <td><input type="number" value="{cap}" min="0" style="width:80px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:0.3rem;border-radius:4px;text-align:center;" onchange="updateRoom('{rnum}', this.value)"></td>
+                <td><button class="btn-delete" onclick="deleteRoom('{rnum}')">Delete</button></td>
+            </tr>'''
+
+    # Build Batches table
+    batches_rows = ''
+    for bid, sb, sec, hc in batches:
+        batches_rows += f'''
+            <tr>
+                <td>{sb}</td>
+                <td>{sec}</td>
+                <td><input type="number" value="{hc}" min="0" style="width:80px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:0.3rem;border-radius:4px;text-align:center;" onchange="updateBatch({bid}, this.value)"></td>
+            </tr>'''
+
+    # Build Electives table
+    electives_rows = ''
+    for eid, code, name, enr in electives:
+        electives_rows += f'''
+            <tr>
+                <td><strong>{code}</strong></td>
+                <td>{name}</td>
+                <td><input type="number" value="{enr}" min="0" style="width:80px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:0.3rem;border-radius:4px;text-align:center;" onchange="updateElective('{code}', this.value)"></td>
+                <td><button class="btn-delete" onclick="deleteElective('{code}')">Delete</button></td>
+            </tr>'''
+
+    # Build Slot Matrix grid
+    days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+    slot_grid = {}
+    for sid, day, st, et, sg in slots:
+        start_str = st.strftime('%H:%M') if hasattr(st, 'strftime') else str(st)[:5]
+        end_str = et.strftime('%H:%M') if hasattr(et, 'strftime') else str(et)[:5]
+        period = f"{start_str}-{end_str}"
+        if period not in slot_grid:
+            slot_grid[period] = {}
+        slot_grid[period][day] = (sid, sg)
+
+    slot_headers = ''.join(f'<th>{d}</th>' for d in days_order)
+    slot_rows = ''
+    for period in sorted(slot_grid.keys()):
+        cells = f'<td><strong>{period}</strong></td>'
+        for day in days_order:
+            if day in slot_grid[period]:
+                sid, sg = slot_grid[period][day]
+                cells += f'<td><input type="text" value="{sg}" style="width:90px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:0.3rem;border-radius:4px;text-align:center;font-size:0.8rem;" onchange="updateSlot({sid}, this.value)"></td>'
+            else:
+                cells += '<td>—</td>'
+        slot_rows += f'<tr>{cells}</tr>'
+
+    # Build Overlaps table
+    overlaps_rows = ''
+    for oid, ba, sa, bb, sb, desc in overlaps:
+        overlaps_rows += f'''
+            <tr>
+                <td>{ba} ({sa})</td>
+                <td>→</td>
+                <td>{bb} ({sb})</td>
+                <td>{desc or ""}</td>
+                <td><button class="btn-delete" onclick="deleteOverlap({oid})">Delete</button></td>
+            </tr>'''
+
+    content = f'''
+    <h1><span class="icon">⚙️</span>Configuration</h1>
+    <p class="subtitle">Manage rooms, batch sizes, elective enrollments, slot matrix, and batch overlaps</p>
+
+    <div id="cfg-msg" style="display:none;padding:0.75rem 1rem;border-radius:8px;font-size:0.85rem;margin-bottom:1rem;"></div>
+
+    <!-- Tab Navigation -->
+    <div style="display:flex;gap:0.5rem;margin-bottom:1.5rem;flex-wrap:wrap;">
+        <button class="tab-btn active" onclick="switchTab('rooms', this)">🏫 Rooms ({len(rooms)})</button>
+        <button class="tab-btn" onclick="switchTab('batches', this)">👥 Batches ({len(batches)})</button>
+        <button class="tab-btn" onclick="switchTab('electives', this)">📚 Elective Enrollment ({len(electives)})</button>
+        <button class="tab-btn" onclick="switchTab('slots', this)">🕐 Slot Matrix</button>
+        <button class="tab-btn" onclick="switchTab('overlaps', this)">🔗 Batch Overlaps ({len(overlaps)})</button>
+    </div>
+
+    <!-- ROOMS TAB -->
+    <div id="tab-rooms" class="tab-content">
+        <div class="table-container">
+            <div class="table-header">
+                <h2>🏫 Room Capacities</h2>
+            </div>
+            <div style="padding:1rem;">
+                <form onsubmit="addRoom(event)" style="display:flex;gap:0.75rem;align-items:flex-end;margin-bottom:1rem;">
+                    <div class="filter-group">
+                        <label>Room Number</label>
+                        <input type="text" id="new-room" placeholder="e.g. CEP301" required style="width:120px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Capacity</label>
+                        <input type="number" id="new-room-cap" placeholder="120" min="1" required style="width:80px;">
+                    </div>
+                    <button type="submit" class="btn btn-green">+ Add Room</button>
+                </form>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>Room</th><th>Type</th><th>Capacity</th><th>Actions</th></tr></thead>
+                    <tbody>{rooms_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- BATCHES TAB -->
+    <div id="tab-batches" class="tab-content" style="display:none;">
+        <div class="table-container">
+            <div class="table-header">
+                <h2>👥 Batch Headcounts</h2>
+                <span class="table-count">Edit headcounts inline</span>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>Sub-Batch</th><th>Section</th><th>Headcount</th></tr></thead>
+                    <tbody>{batches_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ELECTIVES TAB -->
+    <div id="tab-electives" class="tab-content" style="display:none;">
+        <div class="table-container">
+            <div class="table-header">
+                <h2>📚 Elective Enrollments</h2>
+            </div>
+            <div style="padding:1rem;">
+                <form onsubmit="addElective(event)" style="display:flex;gap:0.75rem;align-items:flex-end;margin-bottom:1rem;">
+                    <div class="filter-group">
+                        <label>Course Code</label>
+                        <input type="text" id="new-elective-code" placeholder="e.g. IT505" required style="width:120px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Enrollment</label>
+                        <input type="number" id="new-elective-enr" placeholder="50" min="0" required style="width:80px;">
+                    </div>
+                    <button type="submit" class="btn btn-green">+ Add Elective</button>
+                </form>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>Code</th><th>Course Name</th><th>Enrollment</th><th>Actions</th></tr></thead>
+                    <tbody>{electives_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- SLOT MATRIX TAB -->
+    <div id="tab-slots" class="tab-content" style="display:none;">
+        <div class="table-container">
+            <div class="table-header">
+                <h2>🕐 Slot Matrix</h2>
+                <span class="table-count">Edit slot assignments inline</span>
+            </div>
+            <div style="padding:1rem;">
+                <form onsubmit="addSlot(event)" style="display:flex;gap:0.75rem;align-items:flex-end;margin-bottom:1rem;">
+                    <div class="filter-group">
+                        <label>Day</label>
+                        <select id="new-slot-day" required>
+                            <option value="Monday">Monday</option>
+                            <option value="Tuesday">Tuesday</option>
+                            <option value="Wednesday">Wednesday</option>
+                            <option value="Thursday">Thursday</option>
+                            <option value="Friday">Friday</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <label>Start Time</label>
+                        <input type="time" id="new-slot-start" required style="width:120px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>End Time</label>
+                        <input type="time" id="new-slot-end" required style="width:120px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Slot Group</label>
+                        <input type="text" id="new-slot-group" placeholder="Slot-9" required style="width:100px;">
+                    </div>
+                    <button type="submit" class="btn btn-green">+ Add Slot</button>
+                </form>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>Period</th>{slot_headers}</tr></thead>
+                    <tbody>{slot_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- OVERLAPS TAB -->
+    <div id="tab-overlaps" class="tab-content" style="display:none;">
+        <div class="table-container">
+            <div class="table-header">
+                <h2>🔗 Batch Overlap Rules</h2>
+                <span class="table-count">Defines which batches share students</span>
+            </div>
+            <div style="padding:1rem;">
+                <form onsubmit="addOverlap(event)" style="display:flex;gap:0.75rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem;">
+                    <div class="filter-group">
+                        <label>Batch A</label>
+                        <input type="text" id="ov-ba" placeholder="CS-Only" required style="width:120px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Section A</label>
+                        <input type="text" id="ov-sa" value="All" style="width:80px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Overlaps with Batch B</label>
+                        <input type="text" id="ov-bb" placeholder="ICT + CS" required style="width:120px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Section B</label>
+                        <input type="text" id="ov-sb" value="Sec B" style="width:80px;">
+                    </div>
+                    <div class="filter-group">
+                        <label>Description</label>
+                        <input type="text" id="ov-desc" placeholder="Optional" style="width:180px;">
+                    </div>
+                    <button type="submit" class="btn btn-green">+ Add Rule</button>
+                </form>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>Batch A</th><th></th><th>Batch B</th><th>Description</th><th>Actions</th></tr></thead>
+                    <tbody>{overlaps_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function switchTab(name, btn) {{
+        document.querySelectorAll('.tab-content').forEach(function(el) {{ el.style.display = 'none'; }});
+        document.querySelectorAll('.tab-btn').forEach(function(el) {{ el.classList.remove('active'); }});
+        document.getElementById('tab-' + name).style.display = 'block';
+        btn.classList.add('active');
+    }}
+
+    function showMsg(text, isError) {{
+        var el = document.getElementById('cfg-msg');
+        el.textContent = text;
+        el.style.display = 'block';
+        el.style.background = isError ? 'rgba(239,68,68,0.1)' : 'rgba(16,185,129,0.1)';
+        el.style.border = isError ? '1px solid rgba(239,68,68,0.3)' : '1px solid rgba(16,185,129,0.3)';
+        el.style.color = isError ? 'var(--accent-red)' : 'var(--accent-green)';
+        window.setTimeout(function() {{ el.style.display = 'none'; }}, 3000);
+    }}
+
+    function cfgPost(url, body) {{
+        return fetch(url, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(body)
+        }}).then(function(r) {{ return r.json(); }});
+    }}
+
+    // Rooms
+    function updateRoom(room, cap) {{
+        cfgPost('/api/admin/config/room', {{ room_number: room, capacity: parseInt(cap) }})
+            .then(function(d) {{ showMsg(d.success ? 'Room updated' : d.error, !d.success); }});
+    }}
+    function deleteRoom(room) {{
+        if (!confirm('Delete room ' + room + '?')) return;
+        cfgPost('/api/admin/config/room/delete', {{ room_number: room }})
+            .then(function(d) {{ if (d.success) location.reload(); else showMsg(d.error, true); }});
+    }}
+    function addRoom(e) {{
+        e.preventDefault();
+        var room = document.getElementById('new-room').value;
+        var cap = parseInt(document.getElementById('new-room-cap').value);
+        cfgPost('/api/admin/config/room', {{ room_number: room, capacity: cap }})
+            .then(function(d) {{ if (d.success) location.reload(); else showMsg(d.error, true); }});
+    }}
+
+    // Batches
+    function updateBatch(bid, hc) {{
+        cfgPost('/api/admin/config/batch', {{ batch_id: bid, headcount: parseInt(hc) }})
+            .then(function(d) {{ showMsg(d.success ? 'Headcount updated' : d.error, !d.success); }});
+    }}
+
+    // Electives
+    function updateElective(code, enr) {{
+        cfgPost('/api/admin/config/elective', {{ course_code: code, enrollment: parseInt(enr) }})
+            .then(function(d) {{ showMsg(d.success ? 'Enrollment updated' : d.error, !d.success); }});
+    }}
+    function deleteElective(code) {{
+        if (!confirm('Delete enrollment for ' + code + '?')) return;
+        cfgPost('/api/admin/config/elective/delete', {{ course_code: code }})
+            .then(function(d) {{ if (d.success) location.reload(); else showMsg(d.error, true); }});
+    }}
+    function addElective(e) {{
+        e.preventDefault();
+        var code = document.getElementById('new-elective-code').value;
+        var enr = parseInt(document.getElementById('new-elective-enr').value);
+        cfgPost('/api/admin/config/elective', {{ course_code: code, enrollment: enr }})
+            .then(function(d) {{ if (d.success) location.reload(); else showMsg(d.error, true); }});
+    }}
+
+    // Slots
+    function updateSlot(sid, sg) {{
+        cfgPost('/api/admin/config/slot', {{ slot_id: sid, slot_group: sg }})
+            .then(function(d) {{ showMsg(d.success ? 'Slot updated' : d.error, !d.success); }});
+    }}
+    function addSlot(e) {{
+        e.preventDefault();
+        cfgPost('/api/admin/config/slot/add', {{
+            day: document.getElementById('new-slot-day').value,
+            start: document.getElementById('new-slot-start').value,
+            end: document.getElementById('new-slot-end').value,
+            slot_group: document.getElementById('new-slot-group').value
+        }}).then(function(d) {{ if (d.success) location.reload(); else showMsg(d.error, true); }});
+    }}
+
+    // Overlaps
+    function deleteOverlap(rid) {{
+        if (!confirm('Delete this overlap rule?')) return;
+        cfgPost('/api/admin/config/overlap/delete', {{ rule_id: rid }})
+            .then(function(d) {{ if (d.success) location.reload(); else showMsg(d.error, true); }});
+    }}
+    function addOverlap(e) {{
+        e.preventDefault();
+        cfgPost('/api/admin/config/overlap', {{
+            batch_a: document.getElementById('ov-ba').value,
+            section_a: document.getElementById('ov-sa').value,
+            batch_b: document.getElementById('ov-bb').value,
+            section_b: document.getElementById('ov-sb').value,
+            description: document.getElementById('ov-desc').value
+        }}).then(function(d) {{ if (d.success) location.reload(); else showMsg(d.error, true); }});
+    }}
+    </script>
+    '''
+
+    return page_shell('Configuration', get_current_user(), 'config', content)
+
+
+# ---------------------------------------------------------------------------
+# Configuration API Endpoints (admin only)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/admin/config/room', methods=['POST'])
+@admin_required
+def api_config_room():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.update_room_capacity(data['room_number'], data['capacity'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/room/delete', methods=['POST'])
+@admin_required
+def api_config_room_delete():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.delete_room(data['room_number'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/batch', methods=['POST'])
+@admin_required
+def api_config_batch():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.update_batch_headcount(data['batch_id'], data['headcount'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/elective', methods=['POST'])
+@admin_required
+def api_config_elective():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.upsert_elective_enrollment(data['course_code'], data['enrollment'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/elective/delete', methods=['POST'])
+@admin_required
+def api_config_elective_delete():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.delete_elective_enrollment(data['course_code'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/slot', methods=['POST'])
+@admin_required
+def api_config_slot():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.update_slot_group(data['slot_id'], data['slot_group'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/slot/add', methods=['POST'])
+@admin_required
+def api_config_slot_add():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.add_time_slot(data['day'], data['start'], data['end'], data['slot_group'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/overlap', methods=['POST'])
+@admin_required
+def api_config_overlap():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.upsert_overlap_rule(data['batch_a'], data['section_a'], data['batch_b'], data['section_b'], data.get('description', ''))
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/config/overlap/delete', methods=['POST'])
+@admin_required
+def api_config_overlap_delete():
+    data = request.get_json()
+    db = DBManager(quiet=True)
+    try:
+        db.delete_overlap_rule(data['rule_id'])
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
 
 
 @app.route('/api/admin/create-user', methods=['POST'])
