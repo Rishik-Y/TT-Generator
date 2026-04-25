@@ -1328,7 +1328,8 @@ def export_pdf(final_courses, pdf_file, slot_matrix):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def run_pipeline(input_file, reference_file=None, output_xlsx=None, output_pdf=None, use_db=True):
+def run_pipeline(input_file, reference_file=None, output_xlsx=None, output_pdf=None,
+                 use_db=True, seed_snapshot_id=None):
     """Run the full timetable generation pipeline.
 
     This is the core function called by both the CLI and the web UI.
@@ -1339,6 +1340,7 @@ def run_pipeline(input_file, reference_file=None, output_xlsx=None, output_pdf=N
         output_xlsx: Output Excel file path. Auto-generated if None.
         output_pdf: Output PDF file path. Auto-generated if None.
         use_db: Whether to mirror data to PostgreSQL.
+        seed_snapshot_id: Optional snapshot ID to warm-start the solver with historical preferences.
 
     Returns:
         dict with keys:
@@ -1416,6 +1418,32 @@ def run_pipeline(input_file, reference_file=None, output_xlsx=None, output_pdf=N
         nodes, sb_props, conflicts, roots = build_graph(courses)
         log(f"  {len(roots)} superblocks, "
             f"{sum(len(v) for v in conflicts.values()) // 2} conflict edges.")
+
+        # Step 3.5: Warm-start from historical snapshot (if provided)
+        if seed_snapshot_id and use_db:
+            try:
+                seed_db = db if db else DBManager(quiet=True)
+                pref_map = seed_db.get_snapshot_preference_map(seed_snapshot_id)
+                if pref_map:
+                    seeded = 0
+                    for root, props in sb_props.items():
+                        for n_id in props['nodes']:
+                            for c in nodes[n_id]:
+                                key = (c['course_code'], c['sub_batch'], c.get('row_sec', 'All'))
+                                if key in pref_map:
+                                    props['pref_slot'] = pref_map[key]
+                                    seeded += 1
+                                    break
+                            if seeded > 0 and props['pref_slot'] == pref_map.get(
+                                (nodes[props['nodes'][0]][0]['course_code'],
+                                 nodes[props['nodes'][0]][0]['sub_batch'],
+                                 nodes[props['nodes'][0]][0].get('row_sec', 'All'))):
+                                break
+                    log(f"  📊 Warm-start: seeded {seeded} superblocks from historical snapshot #{seed_snapshot_id}")
+                if not db and seed_db:
+                    seed_db.close()
+            except Exception as e:
+                log(f"  ⚠ Warm-start seeding failed (continuing normally): {e}")
 
         # Step 4: Solve CSP
         step += 1
