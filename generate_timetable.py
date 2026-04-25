@@ -192,10 +192,20 @@ def load_slot_matrix(ref_file=None):
     """Try to read the Slots sheet from the reference timetable file."""
     if ref_file is None:
         return DEFAULT_SLOT_MATRIX
+    
+    import os
+    if not os.path.exists(ref_file):
+        return DEFAULT_SLOT_MATRIX
+
     try:
         xl = pd.ExcelFile(ref_file)
-        if 'Slots' not in xl.sheet_names:
-            return DEFAULT_SLOT_MATRIX
+    except Exception as e:
+        raise ValueError(f"Could not read Reference file '{ref_file}': {e}")
+        
+    if 'Slots' not in xl.sheet_names:
+        raise ValueError(f"Invalid Reference Timetable. Could not find a 'Slots' sheet in {os.path.basename(ref_file)}.")
+        
+    try:
         df = pd.read_excel(xl, 'Slots', header=None)
         # Find the header row (contains "Monday")
         header_row = None
@@ -204,8 +214,10 @@ def load_slot_matrix(ref_file=None):
             if 'Monday' in vals:
                 header_row = idx
                 break
+                
         if header_row is None:
-            return DEFAULT_SLOT_MATRIX
+            raise ValueError(f"Invalid Reference Timetable. Found 'Slots' sheet but no 'Monday' column header. Did you accidentally upload the Slot Assignment Excel here?")
+            
         days_row = df.iloc[header_row]
         day_cols = {}
         for col_idx, val in enumerate(days_row):
@@ -227,11 +239,14 @@ def load_slot_matrix(ref_file=None):
                     matrix[day][time_norm] = slot
         # Validate that we got enough data
         if all(len(v) >= 5 for v in matrix.values()):
-            print(f"  Loaded slot matrix from '{ref_file}' → Slots sheet.")
+            print(f"  Loaded slot matrix from '{os.path.basename(ref_file)}' → Slots sheet.")
             return matrix
-        return DEFAULT_SLOT_MATRIX
-    except Exception:
-        return DEFAULT_SLOT_MATRIX
+        
+        raise ValueError(f"Invalid Reference Timetable. The 'Slots' sheet in {os.path.basename(ref_file)} is missing required data for all 5 days.")
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Error parsing Reference Timetable '{os.path.basename(ref_file)}': {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -262,16 +277,45 @@ def is_core(course_type):
 # ---------------------------------------------------------------------------
 # Parse input Excel
 # ---------------------------------------------------------------------------
+def clean_string_spaces(val):
+    """Helper to remove extra spaces from strings to avoid formatting issues."""
+    if pd.isna(val):
+        return val
+    s = str(val).strip()
+    if s.lower() == 'nan' or not s:
+        return None
+    # Collapse multiple spaces into one
+    return re.sub(r'\s+', ' ', s)
+
 def parse_excel(input_file):
     """Parse the slot-assignment Excel into a list of course dicts."""
     try:
         df = pd.read_excel(input_file, header=None)
     except FileNotFoundError:
-        print(f"ERROR: Input file '{input_file}' not found.")
-        sys.exit(1)
+        raise ValueError(f"Input file '{input_file}' not found.")
     except Exception as e:
-        print(f"ERROR: Could not read '{input_file}': {e}")
-        sys.exit(1)
+        raise ValueError(f"Could not read '{input_file}': {e}")
+
+    # --- Pre-Insertion Data Validity & Sanitization Checks ---
+    if df.empty:
+        raise ValueError("The uploaded Excel file is empty.")
+
+    if len(df.columns) < 5:
+        raise ValueError("Invalid format: The file does not have enough columns to be a Slot Assignment Excel.")
+
+    # Validate header structure
+    header_row_str = " ".join([str(x).lower() for x in df.iloc[0].values])
+    first_cell = str(df.iloc[0, 0]).strip().lower()
+    if 'batch' not in first_cell:
+        raise ValueError(f"Invalid Slot Assignment Excel. The first cell must contain 'Batch'. You uploaded a file starting with '{str(df.iloc[0, 0])}'. Did you swap the files?")
+
+    if 'slot-1' not in header_row_str and 'slot 1' not in header_row_str:
+         raise ValueError("Invalid format: Could not find 'Slot-1' in the header row. This is not a valid Slot Assignment Excel.")
+
+    # Sanitize the entire dataframe to fix weird formatting or double spaces
+    # This prevents invisible poisoning of database constraints
+    df = df.astype(str).map(clean_string_spaces)
+    # ---------------------------------------------------------
 
     # Forward-fill batch and sub-batch columns
     df.iloc[:, 0] = df.iloc[:, 0].ffill()
