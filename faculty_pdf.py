@@ -119,17 +119,32 @@ def generate_faculty_pdf(db, faculty_short_name):
         for day in DAYS:
             cell_entries = schedule.get((day, hour_key), [])
             if cell_entries:
-                lines = []
+                grouped = {}
                 for e in cell_entries:
                     code = e.get('course_code', '?')
                     room = e.get('room_number', '-') or '-'
+                    g_key = (code, room)
+                    if g_key not in grouped:
+                        grouped[g_key] = []
+                    
                     batch = e.get('sub_batch', '')
                     sec = e.get('section', '')
+                    # Minimal shortening if desired, but let's keep original unless requested. The previous code did some replacements.
+                    # Actually let's keep the previous code's replacements just in case.
                     batch_short = batch.replace('BTech Sem-II ', '').replace(
                         'BTech Sem-IV ', '').replace('BTech Sem-VI ', '')
+                    batch_str = f"{batch_short}"
+                    if sec and sec != 'All':
+                        batch_str += f" (Sec {sec})"
+                    
+                    grouped[g_key].append(batch_str)
+                
+                lines = []
+                for (code, room), batches in grouped.items():
+                    batches_joined = ' | '.join(batches)
                     lines.append(
                         f'<b>{code}</b><br/>'
-                        f'{room} | {batch_short} {sec}'
+                        f'{room} | {batches_joined}'
                     )
                 cell_text = '<br/>'.join(lines)
             else:
